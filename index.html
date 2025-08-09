@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Locked & Rocked & Rolled — 6 Dice with Auto-Spread</title>
+<style>
+  html,body { margin:0; padding:0; height:100%; background:#0f1220; color:#e8ecff; font-family:system-ui, sans-serif; overflow:hidden; }
+  #controls {
+    position:absolute; top:10px; left:10px; display:flex; gap:8px; flex-wrap:wrap;
+    background:rgba(0,0,0,.5); padding:8px; border-radius:10px; z-index:10; border:1px solid #2d3563;
+  }
+  button,label {
+    background:#1f2542; border:1px solid #2d3563; color:#e8ecff; padding:8px 12px;
+    border-radius:10px; cursor:pointer; font-weight:700; font-size:14px;
+  }
+  button:hover,label:hover { border-color:#3a4590; }
+  #sum {
+    position:absolute; bottom:10px; right:10px; background:rgba(0,0,0,.5);
+    padding:6px 12px; border-radius:8px; font-size:16px; z-index:10; border:1px solid #2d3563;
+  }
+  canvas { display:block; width:100%; height:100%; }
+</style>
+</head>
+<body>
+<div id="controls">
+  <button id="rollBtn">Roll 🎲 (R)</button>
+  <label><input id="soundChk" type="checkbox" checked /> Sound</label>
+  <button id="resetBtn">Reset</button>
+</div>
+<div id="sum">Sum: 0</div>
+<canvas id="canvas"></canvas>
+
+<script>
+(function(){
+  // ---------- Canvas / DPR ----------
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+  let DPR = Math.min(2, window.devicePixelRatio || 1);
+  function resize(){
+    DPR = Math.min(2, window.devicePixelRatio || 1);
+    canvas.width = Math.floor(window.innerWidth * DPR);
+    canvas.height = Math.floor(window.innerHeight * DPR);
+    ctx.setTransform(DPR,0,0,DPR,0,0); // draw in CSS pixels
+  }
+  resize(); addEventListener('resize', resize);
+
+  // ---------- Audio (synth SFX, no files) ----------
+  const soundChk = document.getElementById('soundChk');
+  let actx = null;
+  const lazyAudio = () => (actx ||= new (window.AudioContext||window.webkitAudioContext)());
+  function envBurst({time=0.08,start=1,end=0.001}={}) {
+    const a = lazyAudio(); const g = a.createGain();
+    g.gain.setValueAtTime(start, a.currentTime);
+    g.gain.exponentialRampToValueAtTime(end, a.currentTime + time);
+    return {a,g,done:a.currentTime+time};
+  }
+  function beep(freq=700, dur=0.08){
+    if(!soundChk.checked) return;
+    const {a,g,done} = envBurst({time:dur,start:0.20});
+    const o = a.createOscillator(); o.type = 'sine'; o.frequency.value = freq;
+    o.connect(g).connect(a.destination); o.start(); o.stop(done);
+  }
+  function clickLock(locked){ locked ? beep(240,0.09) : beep(900,0.06); }
+  function thud(){
+    if(!soundChk.checked) return;
+    const {a,g,done} = envBurst({time:0.05,start:0.35});
+    const buf = a.createBuffer(1, a.sampleRate*0.05, a.sampleRate);
+    const ch = buf.getChannelData(0);
+    for(let i=0;i<ch.length;i++) ch[i] = (Math.random()*2-1) * (1 - i/ch.length);
+    const src = a.createBufferSource(); src.buffer = buf;
+    const lp = a.createBiquadFilter(); lp.type='lowpass'; lp.frequency.value=700;
+    src.connect(lp).connect(g).connect(a.destination); src.start(); src.stop(done);
+  }
+  function whoosh(){
+    if(!soundChk.checked) return;
+    const {a,g,done} = envBurst({time:0.35,start:0.18});
+    const buf = a.createBuffer(1, a.sampleRate*0.35, a.sampleRate);
+    const ch = buf.getChannelData(0);
+    for(let i=0;i<ch.length;i++) ch[i] = (Math.random()*2-1) * (1 - i/ch.length);
+    const src = a.createBufferSource(); src.buffer = buf;
+    const bp = a.createBiquadFilter(); bp.type='bandpass'; bp.frequency.value=420; bp.Q.value=0.7;
+    src.connect(bp).connect(g).connect(a.destination); src.start(); src.stop(done);
+  }
+
+  // ---------- Dice physics ----------
+  const TAU = Math.PI*2;
+  const rand=(a,b)=>a+Math.random()*(b-a);
+  const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+
+  class Die {
+    constructor(x,y,size){
+      this.x=x; this.y=y; this.size=size;
+      this.vx=rand(-260,260); this.vy=rand(-240,-100);
+      this.ax=0; this.ay=980;              // gravity
+      this.rot=rand(0,TAU); this.vr=rand(-12,12);
+      this.locked=false;
+      this.face=1+Math.floor(Math.random()*6);
+      this.settleT=0;
+      this.lastBounce=0;
+
+      // tween to target (for auto-spread)
+      this.tx=null; this.ty=null; this.tween=0; this.tweenDur=0.45; this.tweening=false;
+    }
+    toggleLock(){ this.locked=!this.locked; clickLock(this.locked); }
+    bounds(){ const h=this.size/2; return {l:this.x-h, r:this.x+h, t:this.y-h, b:this.y+h}; }
+    startTween(tx,ty){ this.tx=tx; this.ty=ty; this.tween=0; this.tweening=true; this.sx=this.x; this.sy=this.y; }
+    update(dt, now){
+      // tween overrides physics
+      if(this.tweening){
+        this.tween = Math.min(1, this.tween + dt/this.tweenDur);
+        const t = 1 - Math.pow(1-this.tween, 3); // easeOutCubic
+        this.x = this.sx + (this.tx - this.sx)*t;
+        this.y = this.sy + (this.ty - this.sy)*t;
+        if(this.tween>=1){ this.tweening=false; }
+        return;
+      }
+
+      if(this.locked) return;
+
+      // physics
+      this.vx += this.ax*dt;
+      this.vy += this.ay*dt;
+      this.x += this.vx*dt;
+      this.y += this.vy*dt;
+      this.rot += this.vr*dt;
+
+      const s=this.size, half=s/2, damp=0.58, fric=0.985;
+      const nowMs = now*1000;
+
+      // walls
+      if(this.x - half < 8){ this.x=8+half; this.vx*=-damp; this.vr*=fric; if(nowMs-this.lastBounce>40){thud(); this.lastBounce=nowMs;} }
+      if(this.x + half > canvas.width/DPR-8){ this.x=canvas.width/DPR-8-half; this.vx*=-damp; this.vr*=fric; if(nowMs-this.lastBounce>40){thud(); this.lastBounce=nowMs;} }
+      if(this.y - half < 8){ this.y=8+half; this.vy*=-damp; this.vr*=fric; if(nowMs-this.lastBounce>40){thud(); this.lastBounce=nowMs;} }
+      // floor
+      if(this.y + half > canvas.height/DPR-8){
+        this.y=canvas.height/DPR-8-half;
+        this.vy*=-damp; this.vx*=fric; this.vr*=fric;
+        if(nowMs-this.lastBounce>40){thud(); this.lastBounce=nowMs;}
+        // settle detector
+        if(Math.hypot(this.vx,this.vy) < 40 && Math.abs(this.vr) < 0.8){
+          this.settleT += dt;
+          if(this.settleT > 0.25){
+            this.vx=this.vy=this.vr=0;
+            this.face = 1 + Math.floor(Math.random()*6);
+          }
+        } else this.settleT=0;
+      }
+    }
+    draw(g){
+      const s=this.size;
+      g.save(); g.translate(this.x,this.y); g.rotate(this.rot);
+      const r=12;
+      g.beginPath();
+      g.moveTo(-s/2+r,-s/2); g.arcTo(s/2,-s/2,s/2,s/2,r);
+      g.arcTo(s/2,s/2,-s/2,s/2,r); g.arcTo(-s/2,s/2,-s/2,-s/2,r);
+      g.arcTo(-s/2,-s/2,s/2,-s/2,r); g.closePath();
+      const grad=g.createLinearGradient(-s/2,-s/2,s/2,s/2);
+      grad.addColorStop(0,"#fbfbff"); grad.addColorStop(1,"#d2d6ef");
+      g.fillStyle=grad; g.strokeStyle="#222842"; g.lineWidth=2; g.fill(); g.stroke();
+      drawPips(g,this.face,s);
+      if(this.locked){ g.globalAlpha=.9; g.fillStyle="rgba(35,196,255,.16)"; g.fillRect(-s/2,-s/2,s,s); g.globalAlpha=1; }
+      g.restore();
+    }
+    contains(px,py){ const b=this.bounds(); return px>=b.l && px<=b.r && py>=b.t && py<=b.b; }
+  }
+
+  function drawPip(g,x,y,rad){ g.beginPath(); g.arc(x,y,rad,0,TAU); g.fillStyle="#1c223d"; g.fill(); }
+  function drawPips(g,face,s){
+    const r=s*0.07, gsp=s*0.22;
+    const spots={
+      1:[[0,0]],
+      2:[[-gsp,-gsp],[gsp,gsp]],
+      3:[[-gsp,-gsp],[0,0],[gsp,gsp]],
+      4:[[-gsp,-gsp],[gsp,-gsp],[-gsp,gsp],[gsp,gsp]],
+      5:[[-gsp,-gsp],[gsp,-gsp],[0,0],[-gsp,gsp],[gsp,gsp]],
+      6:[[-gsp,-gsp],[gsp,-gsp],[-gsp,0],[gsp,0],[-gsp,gsp],[gsp,gsp]],
+    }[face];
+    for(const [x,y] of spots) drawPip(g,x,y,r);
+  }
+
+  // ---------- World / UI ----------
+  const rollBtn=document.getElementById('rollBtn');
+  const resetBtn=document.getElementById('resetBtn');
+  const sumEl=document.getElementById('sum');
+
+  let dice=[], last=0, rolling=false, spreadQueued=false;
+
+  function layoutSix(){
+    dice.length=0;
+    const W = canvas.width / DPR, H = canvas.height / DPR;
+    const size = clamp(Math.min(W,H)*0.12, 54, 96);
+    // Place in a loose cluster mid-screen
+    for(let i=0;i<6;i++){
+      const x = W*0.5 + rand(-W*0.15,W*0.15);
+      const y = H*0.35 + rand(-H*0.10,H*0.10);
+      dice.push(new Die(x,y,size));
+    }
+    updateSum();
+  }
+
+  function updateSum(){ sumEl.textContent = `Sum: ${dice.reduce((a,d)=>a+d.face,0)}`; }
+
+  function everyoneSettled(){
+    return dice.every(d => d.locked || (d.vx===0 && d.vy===0 && d.vr===0 && d.settleT>0.25 && !d.tweening));
+  }
+
+  function roll(){
+    rolling = true; spreadQueued = false; whoosh();
+    for(const d of dice){
+      if(d.locked) continue;
+      d.vx=rand(-340,340);
+      d.vy=rand(-260,-120);
+      d.vr=rand(-13,13);
+      d.settleT=0;
+    }
+  }
+
+  function reset(){ layoutSix(); }
+
+  // --- Auto-spread after settle ---
+  function spreadDice(){
+    const W = canvas.width / DPR, H = canvas.height / DPR;
+    const pad = 20;
+    // two neat rows of 3, near bottom half
+    // targets chosen so no overlap and numbers are readable
+    const cols = 3, rows = 2;
+    const cellW = (W - pad*2) / cols;
+    const cellH = Math.min(140, (H*0.45 - pad*2) / rows);
+    const topY = H*0.48;
+
+    const targets = [];
+    let k = 0;
+    for(let r=0;r<rows;r++){
+      for(let c=0;c<cols;c++){
+        const tx = pad + cellW*c + cellW/2;
+        const ty = topY + r*cellH + cellH/2;
+        targets.push({x:tx, y:ty, i:k++});
+      }
+    }
+    // assign dice to targets by nearest-first for minimal travel
+    const remainingTargets = targets.slice();
+    for(const d of dice){
+      // pick nearest target
+      let bestIdx=0, bestDist=Infinity;
+      for(let i=0;i<remainingTargets.length;i++){
+        const t = remainingTargets[i];
+        const dx = d.x - t.x, dy = d.y - t.y;
+        const dist = dx*dx + dy*dy;
+        if(dist < bestDist){ bestDist=dist; bestIdx=i; }
+      }
+      const target = remainingTargets.splice(bestIdx,1)[0];
+      d.startTween(target.x, target.y);
+      // ensure face stays visible (stop spinning)
+      d.vx=d.vy=d.vr=0; d.settleT=1;
+    }
+  }
+
+  function tick(ts){
+    const t = ts/1000;
+    const dt = Math.min(.032, t - (last||t));
+    last = t;
+
+    // update
+    for(const d of dice) d.update(dt, t);
+
+    // draw
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    // subtle sheen at top
+    const sheen=ctx.createLinearGradient(0,0,0,canvas.height/DPR);
+    sheen.addColorStop(0,"rgba(35,196,255,.05)");
+    sheen.addColorStop(1,"rgba(35,196,255,0)");
+    ctx.fillStyle=sheen; ctx.fillRect(0,0,canvas.width/DPR,120);
+    for(const d of dice) d.draw(ctx);
+
+    // settle -> spread
+    if(rolling && everyoneSettled()){
+      rolling = false;
+      if(!spreadQueued){
+        spreadQueued = true;
+        spreadDice();
+        updateSum();
+      }
+    }
+
+    requestAnimationFrame(tick);
+  }
+
+  // ---------- Input ----------
+  canvas.addEventListener('click', e=>{
+    const rect = canvas.getBoundingClientRect();
+    const x = (e.clientX - rect.left);
+    const y = (e.clientY - rect.top);
+    for(let i=dice.length-1;i>=0;i--){
+      if(dice[i].contains(x,y)){ dice[i].toggleLock(); break; }
+    }
+  });
+  addEventListener('keydown', e=>{ if(e.key.toLowerCase()==='r') roll(); });
+  document.getElementById('rollBtn').addEventListener('click', roll);
+  document.getElementById('resetBtn').addEventListener('click', reset);
+
+  // ---------- Boot ----------
+  reset();
+  requestAnimationFrame(tick);
+})();
+</script>
+</body>
+</html>
