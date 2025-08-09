@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Locked & Rocked & Rolled — Fullscreen</title>
+<style>
+  html,body { margin:0; padding:0; height:100%; background:#0f1220; color:#e8ecff; font-family:system-ui, sans-serif; overflow:hidden; }
+  #controls {
+    position:absolute; top:10px; left:10px; display:flex; gap:8px; flex-wrap:wrap;
+    background:rgba(0,0,0,0.5); padding:8px; border-radius:8px; z-index:10;
+  }
+  button,label {
+    background:#1f2542; border:1px solid #2d3563; color:#e8ecff; padding:8px 12px;
+    border-radius:8px; cursor:pointer; font-weight:bold; font-size:14px;
+  }
+  button:hover,label:hover { border-color:#3a4590; }
+  input[type="number"] { width:60px; padding:4px; border-radius:6px; border:1px solid #2d3563; background:#141830; color:#e8ecff; font-weight:bold; }
+  #sum {
+    position:absolute; bottom:10px; right:10px; background:rgba(0,0,0,0.5);
+    padding:6px 12px; border-radius:6px; font-size:16px; z-index:10;
+  }
+  canvas { display:block; width:100%; height:100%; }
+</style>
+</head>
+<body>
+<div id="controls">
+  <button id="rollBtn">Roll 🎲 (R)</button>
+  <label><input id="soundChk" type="checkbox" checked /> Sound</label>
+  <label>Dice: <input id="countInput" type="number" min="1" max="12" value="5" /></label>
+  <button id="resetBtn">Reset</button>
+</div>
+<div id="sum">Sum: 0</div>
+<canvas id="canvas"></canvas>
+
+<script>
+(function(){
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+  const DPR = Math.min(2, window.devicePixelRatio || 1);
+  let W, H;
+
+  function resize(){
+    W = Math.floor(window.innerWidth * DPR);
+    H = Math.floor(window.innerHeight * DPR);
+    canvas.width = W; canvas.height = H;
+    ctx.setTransform(DPR,0,0,DPR,0,0);
+  }
+  resize(); addEventListener('resize', resize);
+
+  // ---- Sound setup ----
+  const soundChk = document.getElementById('soundChk');
+  let actx = null;
+  function lazyAudio(){ if(!actx) actx=new (window.AudioContext||window.webkitAudioContext)(); return actx; }
+  function envBurst({time=0.08,start=1,end=0.001}={}){
+    const a=lazyAudio(); const g=a.createGain(); g.gain.setValueAtTime(start,a.currentTime);
+    g.gain.exponentialRampToValueAtTime(end,a.currentTime+time);
+    return {a,g,doneAt:a.currentTime+time};
+  }
+  function beep(freq=600,dur=0.08){
+    if(!soundChk.checked) return;
+    const {a,g,doneAt}=envBurst({time:dur,start:0.2});
+    const o=a.createOscillator(); o.frequency.value=freq; o.type='sine';
+    o.connect(g).connect(a.destination); o.start(); o.stop(doneAt);
+  }
+  function clickLock(locked){ locked?beep(220,0.09):beep(880,0.06); }
+  function thud(){
+    if(!soundChk.checked) return;
+    const a=lazyAudio(); const {g,doneAt}=envBurst({time:0.06,start:0.35});
+    const buffer=a.createBuffer(1,a.sampleRate*0.06,a.sampleRate);
+    const data=buffer.getChannelData(0);
+    for(let i=0;i<data.length;i++) data[i]=(Math.random()*2-1)*(1-i/data.length);
+    const src=a.createBufferSource(); src.buffer=buffer;
+    const bq=a.createBiquadFilter(); bq.type='lowpass'; bq.frequency.value=800;
+    src.connect(bq).connect(g).connect(a.destination); src.start(); src.stop(doneAt);
+  }
+  function rollWhoosh(){
+    if(!soundChk.checked) return;
+    const a=lazyAudio(); const {g,doneAt}=envBurst({time:0.35,start:0.18});
+    const buffer=a.createBuffer(1,a.sampleRate*0.35,a.sampleRate);
+    const data=buffer.getChannelData(0);
+    for(let i=0;i<data.length;i++) data[i]=(Math.random()*2-1)*(1-i/data.length);
+    const src=a.createBufferSource(); src.buffer=buffer;
+    const bq=a.createBiquadFilter(); bq.type='bandpass'; bq.frequency.value=400; bq.Q.value=0.6;
+    src.connect(bq).connect(g).connect(a.destination); src.start(); src.stop(doneAt);
+  }
+
+  // ---- Dice physics ----
+  const rand=(a,b)=>a+Math.random()*(b-a);
+  const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+  const TAU=Math.PI*2;
+  class Die{
+    constructor(x,y,size){
+      this.x=x; this.y=y; this.size=size;
+      this.vx=rand(-240,240); this.vy=rand(-200,-80);
+      this.ax=0; this.ay=980;
+      this.rot=rand(0,TAU); this.vr=rand(-10,10);
+      this.locked=false; this.face=1+Math.floor(Math.random()*6);
+      this.settleT=0; this.lastBounce=0;
+    }
+    toggleLock(){ this.locked=!this.locked; clickLock(this.locked); }
+    bounding(){ const h=this.size/2; return {l:this.x-h,r:this.x+h,t:this.y-h,b:this.y+h}; }
+    update(dt,now){
+      if(this.locked) return;
+      this.vx+=this.ax*dt; this.vy+=this.ay*dt;
+      this.x+=this.vx*dt; this.y+=this.vy*dt; this.rot+=this.vr*dt;
+      const s=this.size,half=s/2,damp=0.58,fric=0.985;
+      const nowMs=now*1000;
+      if(this.x-half<8){this.x=8+half;this.vx*=-damp;this.vr*=fric;if(nowMs-this.lastBounce>40){thud();this.lastBounce=nowMs;}}
+      if(this.x+half>canvas.width/DPR-8){this.x=canvas.width/DPR-8-half;this.vx*=-damp;this.vr*=fric;if(nowMs-this.lastBounce>40){thud();this.lastBounce=nowMs;}}
+      if(this.y-half<8){this.y=8+half;this.vy*=-damp;this.vr*=fric;if(nowMs-this.lastBounce>40){thud();this.lastBounce=nowMs;}}
+      if(this.y+half>canvas.height/DPR-8){
+        this.y=canvas.height/DPR-8-half; this.vy*=-damp; this.vx*=fric; this.vr*=fric;
+        if(nowMs-this.lastBounce>40){thud();this.lastBounce=nowMs;}
+        if(Math.hypot(this.vx,this.vy)<40 && Math.abs(this.vr)<0.8){
+          this.settleT+=dt;
+          if(this.settleT>0.25){ this.vx=this.vy=this.vr=0; this.face=1+Math.floor(Math.random()*6); }
+        } else this.settleT=0;
+      }
+    }
+    draw(g){
+      const s=this.size;
+      g.save(); g.translate(this.x,this.y); g.rotate(this.rot);
+      const r=12;
+      g.beginPath();
+      g.moveTo(-s/2+r,-s/2); g.arcTo(s/2,-s/2,s/2,s/2,r);
+      g.arcTo(s/2,s/2,-s/2,s/2,r); g.arcTo(-s/2,s/2,-s/2,-s/2,r);
+      g.arcTo(-s/2,-s/2,s/2,-s/2,r);
+      g.closePath();
+      const grad=g.createLinearGradient(-s/2,-s/2,s/2,s/2);
+      grad.addColorStop(0,"#fbfbff"); grad.addColorStop(1,"#d2d6ef");
+      g.fillStyle=grad; g.strokeStyle="#222842"; g.lineWidth=2; g.fill(); g.stroke();
+      drawPips(g,this.face,s);
+      if(this.locked){
+        g.globalAlpha=.9; g.fillStyle="rgba(35,196,255,.16)";
+        g.fillRect(-s/2,-s/2,s,s); g.globalAlpha=1;
+      }
+      g.restore();
+    }
+    contains(px,py){ const {l,r,t,b}=this.bounding(); return px>=l&&px<=r&&py>=t&&py<=b; }
+  }
+  function drawPip(g,x,y,rad){ g.beginPath(); g.arc(x,y,rad,0,TAU); g.fillStyle="#1c223d"; g.fill(); }
+  function drawPips(g,face,s){
+    const r=s*0.07, gsp=s*0.22;
+    const spots={
+      1:[[0,0]],
+      2:[[-gsp,-gsp],[gsp,gsp]],
+      3:[[-gsp,-gsp],[0,0],[gsp,gsp]],
+      4:[[-gsp,-gsp],[gsp,-gsp],[-gsp,gsp],[gsp,gsp]],
+      5:[[-gsp,-gsp],[gsp,-gsp],[0,0],[-gsp,gsp],[gsp,gsp]],
+      6:[[-gsp,-gsp],[gsp,-gsp],[-gsp,0],[gsp,0],[-gsp,gsp],[gsp,gsp]],
+    }[face];
+    for(const [x,y] of spots) drawPip(g,x,y,r);
+  }
+
+  // ---- World & UI ----
+  let dice=[], last=0, rolling=false;
+  const sumEl=document.getElementById('sum');
+  const rollBtn=document.getElementById('rollBtn');
+  const resetBtn=document.getElementById('resetBtn');
+  const countInput=document.getElementById('countInput');
+
+  function layoutDice(n){
+    dice.length=0;
+    const cols=Math.ceil(Math.sqrt(n)), rows=Math.ceil(n/cols);
+    const pad=16, cellW=(canvas.width/DPR - pad*2)/cols, cellH=(canvas.height/DPR - pad*2)/rows;
+    const size=Math.min(96, Math.max(54, Math.min(cellW,cellH)*0.7));
+    let k=0;
+    for(let r=0;r<rows;r++){
+      for(let c=0;c<cols;c++){
+        if(k>=n) break;
+        const x=pad + cellW*c + cellW/2 + rand(-8,8);
+        const y=pad + cellH*r + cellH/2 + rand(-8,8);
+        dice.push(new Die(x,y,size)); k++;
+      }
+    }
+    updateSum();
+  }
+  function updateSum(){ sumEl.textContent=`Sum: ${dice.reduce((a,d)=>a+d.face,0)}`; }
+  function roll(){
+    rolling=true; rollWhoosh();
+    for(const d of dice){
+      if(d.locked) continue;
+      d.vx=rand(-300,300); d.vy=rand(-220,-90); d.vr=rand(-12,12); d.settleT=0;
+    }
+  }
+  function reset(){ layoutDice(clamp(+countInput.value||5,1,12)); }
+  function tick(ts){
+    const t=ts/1000, dt=Math.min(.032,t-(last||t)); last=t;
+    for(const d of dice) d.update(dt,t);
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    for(const d of dice) d.draw(ctx);
+    if(rolling){
+      const moving=dice.some(d=>!d.locked && (Math.abs(d.vx)+Math.abs(d.vy)+Math.abs(d.vr))>0.1);
+      if(!moving){ rolling=false; updateSum(); }
+    }
+    requestAnimationFrame(tick);
+  }
+
+  canvas.addEventListener('click',e=>{
+    const rect=canvas.getBoundingClientRect(), x=(e.clientX-rect.left), y=(e.clientY-rect.top);
+    for(let i=dice.length-1;i>=0;i--){ if(dice[i].contains(x,y)){ dice[i].toggleLock(); break; } }
+  });
+  rollBtn.addEventListener('click',roll);
+  resetBtn.addEventListener('click',reset);
+  countInput.addEventListener('change',reset);
+  addEventListener('keydown',e=>{ if(e.key.toLowerCase()==='r') roll(); });
+
+  reset();
+  requestAnimationFrame(tick);
+})();
+</script>
+</body>
+</html>
